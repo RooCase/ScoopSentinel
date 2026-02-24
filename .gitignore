@@ -4,6 +4,7 @@ config.txt
 
 # Sensor log — large over time and machine-specific
 litter_log.csv
+litter_log.csv.lock
 
 # macOS metadata
 .DS_Store
