@@ -60,12 +60,17 @@ def cleanup_log() -> None:
     opens LOG_FILE for append at the exact moment os.replace() fires; in that
     case one row could be lost. Full safety would require base.py to also
     acquire this lock before calling log_reading().
+
+    Rows whose timestamp can't be parsed (e.g. NUL-padded bytes left behind by
+    an interrupted write, such as a power loss mid-append) are dropped rather
+    than crashing the run — this doubles as the mechanism that repairs the log
+    file on disk, since the temp file replaces the original.
     """
     if not os.path.exists(LOG_FILE):
         return
 
     cutoff = datetime.now(CENTRAL) - timedelta(hours=48)
-    kept, removed = 0, 0
+    kept, removed, corrupt = 0, 0, 0
     tmp_path = None
 
     with open(LOCK_FILE, "w") as lock_fd:
@@ -79,7 +84,11 @@ def cleanup_log() -> None:
                 writer = csv.DictWriter(tmp, fieldnames=reader.fieldnames)
                 writer.writeheader()
                 for row in reader:
-                    ts = datetime.fromisoformat(row["timestamp"])
+                    try:
+                        ts = datetime.fromisoformat(row["timestamp"])
+                    except (ValueError, TypeError):
+                        corrupt += 1
+                        continue
                     if ts >= cutoff:
                         writer.writerow(row)
                         kept += 1
@@ -93,7 +102,10 @@ def cleanup_log() -> None:
                 os.unlink(tmp_path)  # remove orphaned temp file on failure
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
-    print(f"Log cleanup: removed {removed} old entries, kept {kept}.")
+    msg = f"Log cleanup: removed {removed} old entries, kept {kept}."
+    if corrupt:
+        msg += f" Discarded {corrupt} row(s) with unparseable timestamps."
+    print(msg)
 
 
 def main():

@@ -40,6 +40,19 @@ LOG_FILE = "litter_log.csv"
 # All time comparisons use Central time so quiet-hours logic is timezone-aware.
 CENTRAL  = ZoneInfo("America/Chicago")
 
+
+def _parse_timestamp(value: str):
+    """Parse a logged ISO-8601 timestamp, or None if the row is corrupt.
+
+    A row can be corrupted by an interrupted write (e.g. power loss mid-append
+    leaves NUL-padded bytes ahead of the real data); such rows should be
+    skipped rather than crash the whole run.
+    """
+    try:
+        return datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+
 # ---------------------------------------------------------------------------
 # Waste-tray (DFI) thresholds — values are percentages (0–100).
 # BOXcutoff1: urgent, repeat every hour.
@@ -101,6 +114,10 @@ def should_send(level: float, msg_type: str) -> bool:
       2. Throttle window — prevents repeat messages within a cooldown period
          (1 hour for urgent levels, 4 hours for advisory levels).
 
+    Both gates are skipped when TEST_MODE is on (config["test"]: true), so you
+    can trigger a real send while testing without waiting for daytime hours or
+    the cooldown to lapse.
+
     The throttle window is determined by looking up the most recent row in
     LOG_FILE where sent=True and type=msg_type, then comparing its timestamp
     against the current time.
@@ -115,8 +132,8 @@ def should_send(level: float, msg_type: str) -> bool:
     """
     now = datetime.now(CENTRAL)
 
-    # Gate 1: quiet hours — no texts before 8 AM or after 11 PM.
-    if not (8 <= now.hour < 23):
+    # Gate 1: quiet hours — no texts before 8 AM or after 11 PM (skipped in TEST_MODE).
+    if not TEST_MODE and not (8 <= now.hour < 23):
         return False
 
     # Gate 2a: determine the throttle window based on severity.
@@ -135,19 +152,23 @@ def should_send(level: float, msg_type: str) -> bool:
         else:
             return False  # level is fine, no message needed
 
-    # Gate 2b: check the log for the most recent sent message of this type.
+    # Gate 2b: check the log for the most recent sent message of this type
+    # (skipped in TEST_MODE so a recent test send doesn't throttle the next one).
     # csv.DictReader requires the file to have a header row; the header is
     # written by log_reading() only when the file is first created.
-    if os.path.exists(LOG_FILE):
+    if not TEST_MODE and os.path.exists(LOG_FILE):
         with open(LOG_FILE, newline="") as f:
             rows = [
                 r for r in csv.DictReader(f)
                 if r["sent"] == "True" and r.get("type") == msg_type
             ]
-        if rows:
-            last_sent = datetime.fromisoformat(rows[-1]["timestamp"])
+        for row in reversed(rows):
+            last_sent = _parse_timestamp(row["timestamp"])
+            if last_sent is None:
+                continue  # skip corrupt row, fall back to the next-most-recent
             if now - last_sent < window:
                 return False
+            break
 
     return True
 
@@ -168,10 +189,13 @@ def should_send_morning() -> bool:
                 r for r in csv.DictReader(f)
                 if r["sent"] == "True" and r.get("type") == "morning"
             ]
-        if rows:
-            last_sent = datetime.fromisoformat(rows[-1]["timestamp"])
+        for row in reversed(rows):
+            last_sent = _parse_timestamp(row["timestamp"])
+            if last_sent is None:
+                continue  # skip corrupt row, fall back to the next-most-recent
             if last_sent.date() == now.date():
                 return False
+            break
     return True
 
 
