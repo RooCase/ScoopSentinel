@@ -199,7 +199,7 @@ def should_send_morning() -> bool:
     return True
 
 
-def morning_digest(dataDump: dict, robot_name: str, pets: list) -> str:
+def morning_digest(dataDump: dict, litter_pct: float, robot_name: str, pets: list) -> str:
     """Build the once-daily morning status SMS.
 
     Includes waste tray %, litter level %, laser cleanliness, lifetime scoops
@@ -208,6 +208,9 @@ def morning_digest(dataDump: dict, robot_name: str, pets: list) -> str:
 
     Args:
         dataDump:   robot.to_dict() output (raw API fields).
+        litter_pct: Calibrated litter level, 0-100 (see robot.litter_level_calculated
+                    in main() — the raw dataDump["litterLevel"] mm reading is not
+                    directly usable as a fill percentage).
         robot_name: Display name of the robot (robot.name).
         pets:       account.pets list; may be empty if none are registered.
                     Each pet object is expected to have .name, .weight, and
@@ -217,9 +220,6 @@ def morning_digest(dataDump: dict, robot_name: str, pets: list) -> str:
         A multiline string ready to be sent as an SMS.
     """
     tray        = dataDump["DFILevelPercent"]
-    # litterLevel is a raw sensor reading in mm; 450 mm is the optimal fill
-    # height reported by the robot as "optimalLitterLevel".
-    litter_pct  = (float(dataDump["litterLevel"]) / 450) * 100
     laser_dirty = dataDump.get("isLaserDirty", False)
     scoops      = dataDump.get("scoopsSavedCount", 0)
 
@@ -350,9 +350,14 @@ async def main() -> None:
                     dataDump = robot.to_dict()
 
                     traylevel   = dataDump["DFILevelPercent"]
-                    # Normalise litter from raw mm to a 0.0–1.0 fraction so it
-                    # can be compared directly against the litterLevel constants.
-                    litterlevel = float(dataDump["litterLevel"]) / 450
+                    # dataDump["litterLevel"] is a raw ToF sensor distance in mm
+                    # (~441 full ... ~471 very low) — NOT a 0–450 fill height, so
+                    # dividing it by 450 always lands near 1.0 regardless of the
+                    # actual level. Use pylitterbot's own calibrated percentage,
+                    # which interprets that mm range correctly, and normalise it
+                    # to a 0.0–1.0 fraction to compare against the litterLevel
+                    # constants.
+                    litterlevel = robot.litter_level_calculated / 100
 
                     # Accumulate alert strings; sent as one combined text if both fire.
                     parts = []
@@ -389,7 +394,7 @@ async def main() -> None:
 
                     # Morning digest is independent of the alert path above.
                     if should_send_morning():
-                        await send_text(session, morning_digest(dataDump, robot.name, account.pets))
+                        await send_text(session, morning_digest(dataDump, litterlevel * 100, robot.name, account.pets))
                         log_reading(traylevel, sent=True, msg_type="morning")
                         print("Morning digest sent.")
 
