@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 import pylitterbot
+from pylitterbot.enums import LitterLevelState
 
 # ---------------------------------------------------------------------------
 # Configuration — loaded from config.json at startup.
@@ -62,14 +63,18 @@ BOXcutoff1 = 90
 BOXcutoff2 = 70
 
 # ---------------------------------------------------------------------------
-# Litter-level thresholds — values are fractions of the optimal fill (0.0–1.0).
-# The robot reports raw mm; main() normalises to this 0–1 scale by dividing by
-# the optimal fill height (450 mm from the API's "optimalLitterLevel" field).
-# litterLevel1: urgent, repeat every hour.
-# litterLevel2: advisory, repeat every four hours.
+# Litter-level alerting is driven by the robot's own litterLevelState rather
+# than a percentage cutoff. Each unit calibrates its own "optimalLitterLevel",
+# so a fixed percentage threshold doesn't transfer across robots — one unit
+# was observed reporting litterLevelPercentage ~69% while litterLevelState
+# was already "LOW" (matching what the app itself displayed). The state is
+# the same signal the Whisker app uses to show "Low"/"Refill"/etc., so it's
+# used as-is instead of re-deriving thresholds from the raw sensor reading.
+# EMPTY: urgent, repeat every hour.
+# LOW / REFILL: advisory, repeat every four hours.
 # ---------------------------------------------------------------------------
-litterLevel1 = 0.2
-litterLevel2 = 0.6
+LITTER_URGENT_STATES = {LitterLevelState.EMPTY}
+LITTER_ADVISORY_STATES = {LitterLevelState.LOW, LitterLevelState.REFILL}
 
 def container_level(level: float) -> str:
     """Return the alert message for the waste tray, or '' if below threshold.
@@ -86,27 +91,29 @@ def container_level(level: float) -> str:
         return f"Hey, Litter Robot is at {level:.1f}%! Please consider emptying soon."
     return ""
 
-def litter_level_message(litterlevel: float) -> str:
+def litter_level_message(state: LitterLevelState | None, percent: float) -> str:
     """Return a status message for the litter sand level.
 
     Always returns a non-empty string; callers must also check should_send()
     to decide whether the 'fine' message should actually be transmitted.
 
     Args:
-        litterlevel: Sand level as a fraction of optimal fill (0.0–1.0).
-                     Computed in main() as raw_mm / 450.
+        state:   robot.litter_level_state — the robot-reported state (the same
+                 signal the Whisker app displays as "Low", "Refill", etc.).
+                 None if the robot didn't report a state.
+        percent: robot.litter_level (litterLevelPercentage as 0–100) — shown
+                 for context only; the alert decision is driven by `state`.
     """
-    aspercentage = litterlevel * 100
-    if litterlevel <= litterLevel1:
-        return f"ALERT: Litter needs refill URGENTLY: current level is {aspercentage:.1f}%"
-    if litterlevel <= litterLevel2:
-        return f"Litter needs refill: current level is {aspercentage:.1f}%"
-    else:
-        return f"Litter level is fine as of now, at {aspercentage:.1f}%"
+    if state == LitterLevelState.EMPTY:
+        return f"ALERT: Litter is empty, refill URGENTLY (sensor: {percent:.0f}%)."
+    if state in LITTER_ADVISORY_STATES:
+        label = state.value.title()
+        return f"Litter needs a refill soon — robot reports '{label}' (sensor: {percent:.0f}%)."
+    return f"Litter level is fine as of now, at {percent:.0f}%"
 
 
 
-def should_send(level: float, msg_type: str) -> bool:
+def should_send(level: float | LitterLevelState | None, msg_type: str) -> bool:
     """Return True if a message of msg_type should be sent given throttle rules and time window.
 
     Two independent gates must both pass:
@@ -124,7 +131,8 @@ def should_send(level: float, msg_type: str) -> bool:
 
     Args:
         level:    For "container": DFILevelPercent (0–100).
-                  For "litter":    normalised sand level (0.0–1.0).
+                  For "litter":    robot.litter_level_state (see LITTER_URGENT_STATES
+                                    / LITTER_ADVISORY_STATES).
         msg_type: "container" or "litter".
 
     Returns:
@@ -145,12 +153,12 @@ def should_send(level: float, msg_type: str) -> bool:
         else:
             return False  # below both thresholds — no alert needed
     elif msg_type == "litter":
-        if level <= litterLevel1:
+        if level in LITTER_URGENT_STATES:
             window = timedelta(hours=1)
-        elif level <= litterLevel2:
+        elif level in LITTER_ADVISORY_STATES:
             window = timedelta(hours=4)
         else:
-            return False  # level is fine, no message needed
+            return False  # level is fine (or unknown), no message needed
 
     # Gate 2b: check the log for the most recent sent message of this type
     # (skipped in TEST_MODE so a recent test send doesn't throttle the next one).
@@ -208,9 +216,8 @@ def morning_digest(dataDump: dict, litter_pct: float, robot_name: str, pets: lis
 
     Args:
         dataDump:   robot.to_dict() output (raw API fields).
-        litter_pct: Calibrated litter level, 0-100 (see robot.litter_level_calculated
-                    in main() — the raw dataDump["litterLevel"] mm reading is not
-                    directly usable as a fill percentage).
+        litter_pct: robot.litter_level (litterLevelPercentage as 0-100), shown
+                    for context — see main()'s comment on litter_state/litter_pct.
         robot_name: Display name of the robot (robot.name).
         pets:       account.pets list; may be empty if none are registered.
                     Each pet object is expected to have .name, .weight, and
@@ -350,14 +357,14 @@ async def main() -> None:
                     dataDump = robot.to_dict()
 
                     traylevel   = dataDump["DFILevelPercent"]
-                    # dataDump["litterLevel"] is a raw ToF sensor distance in mm
-                    # (~441 full ... ~471 very low) — NOT a 0–450 fill height, so
-                    # dividing it by 450 always lands near 1.0 regardless of the
-                    # actual level. Use pylitterbot's own calibrated percentage,
-                    # which interprets that mm range correctly, and normalise it
-                    # to a 0.0–1.0 fraction to compare against the litterLevel
-                    # constants.
-                    litterlevel = robot.litter_level_calculated / 100
+                    # litter_level_state is the robot-reported state (same signal
+                    # the app shows as "Low" etc.) and drives the alert decision.
+                    # litter_level is the API's own litterLevelPercentage (0-100),
+                    # shown for context only — see LITTER_URGENT_STATES/
+                    # LITTER_ADVISORY_STATES above for why a raw-sensor-derived
+                    # percentage threshold doesn't work across robots.
+                    litter_state = robot.litter_level_state
+                    litter_pct   = robot.litter_level
 
                     # Accumulate alert strings; sent as one combined text if both fire.
                     parts = []
@@ -372,15 +379,15 @@ async def main() -> None:
                         log_reading(traylevel, sent=False, msg_type="container")
                         print(f"Container: no message ({reason}).")
 
-                    litter_msg = litter_level_message(litterlevel)
-                    if litter_msg and should_send(litterlevel, "litter"):
+                    litter_msg = litter_level_message(litter_state, litter_pct)
+                    if litter_msg and should_send(litter_state, "litter"):
                         parts.append(litter_msg)
-                        # Store as percentage (0–100) to keep log values consistent.
-                        log_reading(litterlevel * 100, sent=True, msg_type="litter")
+                        log_reading(litter_pct, sent=True, msg_type="litter")
                         print("Litter message queued.")
                     else:
-                        reason = "fine" if litterlevel > litterLevel2 else "throttled or outside hours"
-                        log_reading(litterlevel * 100, sent=False, msg_type="litter")
+                        urgent_or_advisory = litter_state in LITTER_URGENT_STATES | LITTER_ADVISORY_STATES
+                        reason = "throttled or outside hours" if urgent_or_advisory else "fine"
+                        log_reading(litter_pct, sent=False, msg_type="litter")
                         print(f"Litter: no message ({reason}).")
 
                     # Send alerts — combined into one SMS when both types fired.
@@ -394,7 +401,7 @@ async def main() -> None:
 
                     # Morning digest is independent of the alert path above.
                     if should_send_morning():
-                        await send_text(session, morning_digest(dataDump, litterlevel * 100, robot.name, account.pets))
+                        await send_text(session, morning_digest(dataDump, litter_pct, robot.name, account.pets))
                         log_reading(traylevel, sent=True, msg_type="morning")
                         print("Morning digest sent.")
 
